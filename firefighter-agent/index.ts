@@ -13,7 +13,7 @@
 import { KadiClient } from '@kadi.build/core';
 
 // Firefighter agent configuration
-const brokerUrl = process.env.KADI_BROKER_URL || 'ws://kadi.build:8080';
+const brokerUrl = process.env.KADI_BROKER_URL || 'ws://localhost:8080';
 const networks = process.env.KADI_NETWORKS?.split(',') || ['global'];
 
 console.log(`🚒 Firefighter Agent connecting to: ${brokerUrl}`);
@@ -292,15 +292,38 @@ class FirefighterAgent {
       // Use vision to check what's around us - look for the fire
       const vision = await this.getVision();
       console.log(`👁️ ${this.agentId} vision check:`, vision);
-      
+
       // Check if we can see any fire hazards nearby
       const fireHazards = vision.hazards?.filter((h: any) => h.type === 'fire') || [];
+      let fireLat = latitude;
+      let fireLon = longitude;
       if (fireHazards.length > 0) {
+        fireLat = fireHazards[0].position?.lat ?? latitude;
+        fireLon = fireHazards[0].position?.lon ?? longitude;
         console.log(`🎯 ${this.agentId} confirmed fire detected - ${fireHazards.length} fire hazards in vision`);
       } else {
         console.log(`❓ ${this.agentId} arrived but no fire detected in vision - may have missed the target`);
       }
-      
+
+      // Check distance to fire
+      const distanceToFire = this.calculateDistance(latitude, longitude, fireLat, fireLon);
+      if (distanceToFire > 44) {
+        console.log(`🚶 ${this.agentId} is ${distanceToFire.toFixed(1)}m from fire, moving closer...`);
+        const moveResult = await this.client.callTool('world-simulator', 'moveMe', {
+          agentId: this.agentId,
+          destination: { lat: fireLat, lon: fireLon },
+          profile: 'walking',
+          urgency: 'emergency'
+        });
+        if ((moveResult as any)?.success) {
+          console.log(`🚶 ${this.agentId} moved closer to fire at ${fireLat}, ${fireLon}`);
+        } else {
+          console.warn(`⚠️ ${this.agentId} failed to move closer to fire`);
+        }
+        // Wait for position update event before suppressing
+        return;
+      }
+
       // Publish firefighter arrival event (status update, not position tracking)
       await this.client.publishEvent('firefighter.arrived', {
         firefighterId: this.agentId,
@@ -311,16 +334,61 @@ class FirefighterAgent {
         fireDetected: fireHazards.length > 0,
         hazardsInVision: fireHazards.length,
         timestamp: new Date().toISOString()
-        // Removed coordinates - let world-simulator handle position tracking
       });
-      
-      // Simulate firefighting work (3-5 seconds)
-      const firefightingTime = 3000 + Math.random() * 2000; // 3-5 seconds
-      console.log(`🚒 ${this.agentId} starting firefighting operations (${(firefightingTime/1000).toFixed(1)}s)...`);
-      
-      setTimeout(async () => {
-        await this.extinguishFireAndReturn(latitude, longitude);
-      }, firefightingTime);
+
+      // Begin suppression loop: keep calling suppressFire until fire is extinguished
+      const fireId = this.currentFireId;
+      if (!fireId) {
+        console.warn(`⚠️ ${this.agentId} has no currentFireId, cannot suppress fire`);
+        return;
+      }
+
+      let fireExtinguished = false;
+      let attempt = 0;
+      while (!fireExtinguished && attempt < 20) { // Max 20 attempts (safety)
+        attempt++;
+        console.log(`🚒 ${this.agentId} attempting to suppress fire ${fireId} (attempt ${attempt})...`);
+        try {
+          const result: any = await this.client.callTool('world-simulator', 'suppressFire', {
+            agentId: this.agentId,
+            fireId: fireId,
+            suppressionRate: 0.3 // or adjust as needed
+          });
+          if (result && result.success && result.fireExtinguished) {
+            console.log(`💧 ${this.agentId} extinguished fire ${fireId}!`);
+            fireExtinguished = true;
+            break;
+          } else {
+            console.log(`🔥 ${this.agentId} suppression attempt: fire still burning (remaining intensity: ${result && result.remainingIntensity !== undefined ? result.remainingIntensity : 'unknown'})`);
+          }
+        } catch (err) {
+          console.error(`❌ ${this.agentId} error calling suppressFire:`, err);
+        }
+        // Wait a bit before next attempt
+        await new Promise(res => setTimeout(res, 1200));
+      }
+
+      if (fireExtinguished) {
+        // Publish fire extinguished event (for logging/analytics)
+        await this.client.publishEvent('fire.extinguished', {
+          fireId: fireId,
+          extinguishedBy: this.agentId,
+          extinguisherType: 'firefighter',
+          action: "extinguished",
+          location: {
+            latitude: fireLat,
+            longitude: fireLon
+          },
+          timestamp: new Date().toISOString(),
+          stationId: this.stationInfo.id,
+        });
+        // Continue to completion/return
+        await this.extinguishFireAndReturn(fireLat, fireLon);
+      } else {
+        console.warn(`⚠️ ${this.agentId} failed to extinguish fire ${fireId} after ${attempt} attempts.`);
+        // Still return to station, but log failure
+        await this.extinguishFireAndReturn(fireLat, fireLon);
+      }
       
     } catch (error) {
       console.error(`❌ ${this.agentId} arrival notification failed:`, error);

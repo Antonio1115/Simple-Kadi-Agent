@@ -13,7 +13,7 @@
 import { KadiClient } from '@kadi.build/core';
 
 // Fire agent configuration
-const brokerUrl = process.env.KADI_BROKER_URL || 'ws://kadi.build:8080';
+const brokerUrl = process.env.KADI_BROKER_URL || 'ws://localhost:8080';
 const networks = process.env.KADI_NETWORKS?.split(',') || ['global'];
 
 console.log(`🔥 Fire Agent connecting to: ${brokerUrl}`);
@@ -75,7 +75,7 @@ async function spawnFire() {
   console.log(`🔥 FIRE STARTED: ${fireId} at ${location.latitude.toFixed(4)}, ${location.longitude.toFixed(4)}`);
   console.log(`   Intensity: ${(properties.intensity * 100).toFixed(0)}% | Size: ${properties.size.toFixed(0)}m | Danger: ${properties.danger_level}`);
   
-  // Publish fire.started event
+  // Publish fire.started event (legacy)
   await fireAgent.publishEvent('fire.started', {
     fireId: fireId, // Add explicit fireId field
     id: fireId,
@@ -87,6 +87,18 @@ async function spawnFire() {
     spread_rate: properties.spread_rate,
     danger_level: properties.danger_level,
     event_type: 'fire_start'
+  });
+
+  // Call world-simulator's spawnHazard tool to create the fire in the simulation
+  await fireAgent.callTool('world-simulator', 'spawnHazard', {
+    hazardId: fireId,
+    type: 'fire',
+    position: { lat: location.latitude, lon: location.longitude },
+    intensity: properties.intensity,
+    radius: properties.size,
+    fireIntensity: 'developing',
+    spreadRate: properties.spread_rate,
+    dangerLevel: properties.danger_level
   });
   
   console.log(`🔥 FIRE STARTED: ${fireId} at ${location.latitude.toFixed(4)}, ${location.longitude.toFixed(4)}`);
@@ -113,6 +125,18 @@ async function spawnFire() {
         danger_level: fire.properties.danger_level,
         event_type: 'fire_spread'
       });
+
+      // Publish world.hazard.fire.updated for frontend
+      await fireAgent.publishEvent('world.hazard.fire.updated', {
+        hazardId: fireId,
+        type: 'fire',
+        position: { lat: fire.location.latitude, lon: fire.location.longitude },
+        intensity: fire.properties.intensity,
+        radius: fire.properties.size,
+        spreadRate: fire.properties.spread_rate,
+        dangerLevel: fire.properties.danger_level,
+        time: Date.now(),
+      });
     }
   }, 10000); // Fire spreads after 10 seconds
   
@@ -130,6 +154,15 @@ async function spawnFire() {
         duration: extinguishTime / 1000,
         event_type: 'fire_extinguished',
         reason: 'auto_extinguish'
+      });
+
+      // Publish world.hazard.fire.removed for frontend
+      await fireAgent.publishEvent('world.hazard.fire.removed', {
+        hazardId: fireId,
+        type: 'fire',
+        position: { lat: location.latitude, lon: location.longitude },
+        time: Date.now(),
+        reason: 'auto_extinguish',
       });
       
       activeFires.delete(fireId);
@@ -161,12 +194,20 @@ async function startFireAgent() {
             if (activeFires.has(fireId)) {
               const fire = activeFires.get(fireId);
               console.log(`🗑️ Despawning extinguished fire ${fireId} at ${fire.location.latitude.toFixed(4)}, ${fire.location.longitude.toFixed(4)}`);
-              
+
+              // Publish world.hazard.fire.removed for frontend
+              await fireAgent.publishEvent('world.hazard.fire.removed', {
+                hazardId: fireId,
+                type: 'fire',
+                position: { lat: fire.location.latitude, lon: fire.location.longitude },
+                time: Date.now(),
+                reason: 'firefighter_extinguish',
+              });
+
               // Remove fire from tracking
               activeFires.delete(fireId);
-              
+
               console.log(`✅ Fire ${fireId} successfully removed from simulation`);
-              
             } else {
               console.log(`⚠️ Fire ${fireId} was not in active fires list - may have already been extinguished`);
             }
